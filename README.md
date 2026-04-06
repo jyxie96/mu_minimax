@@ -14,15 +14,15 @@ Data preprocessing pipeline for the Yelp Academic Dataset. Reads the raw review 
 
 ### `yelp_estimate.py`
 
-Runs the unlearning estimation experiments on the Yelp dataset. Builds a bag-of-words feature matrix (top 1,500 words + intercept) to predict star ratings. Compares Pre-train, Retrain, Retain-Subsample, ULS, GradDiff, ULS+, and PRU (Projective Residual Update) estimators over 20 folds, reporting both prediction error and parameter error.
+Runs the unlearning estimation experiments on the Yelp dataset. Builds a bag-of-words feature matrix (top 1,500 words + intercept) to predict star ratings. Compares Pre-train, Retrain, Retain-Subsample, ULS, GradDiff, ULS+, and PRU (Projective Residual Update) estimators over 20 folds.
 
 ### `ukb_data_analysis.py`
 
-Exploratory data analysis script for the UK Biobank Hospital Episode Statistics (HES) inpatient table (`hesin.csv`). Prints data quality reports, column variance summaries, and date analyses. Exports a cleaned version of the full dataset as well as yearly slices (2021, 2022) and cross-tabulation tables.
+Exploratory data analysis script for the UK Biobank Hospital Episode Statistics (HES) inpatient table (`hesin.csv`). Prints data quality reports, column variance summaries, and date analyses. Exports a cleaned version of the full dataset as well as yearly slices (2022).
 
 ### `ukb_estimate.py`
 
-Runs the unlearning estimation experiments on the UK Biobank 2022 hospital episode data. Predicts log-transformed episode duration (`epidur`) using mixed OneHotEncoder and TargetEncoder features, with Lasso-based feature selection. The forget set is defined as long-duration outlier episodes (above Q3 + 1.5×IQR). Compares the same family of estimators as the Yelp experiments and additionally performs asymptotic inference on a specific coefficient (`operstat`).
+Runs the unlearning estimation experiments on the UK Biobank 2022 hospital episode data. Predicts log-transformed episode duration (`epidur`) using mixed OneHotEncoder and TargetEncoder features, with Lasso-based feature selection. The forget set is defined as long-duration outlier episodes (above Q3 + 1.5×IQR). Compares the same estimators as the Yelp experiments and additionally performs asymptotic inference on a specific coefficient (`operstat`).
 
 ## Datasets
 
