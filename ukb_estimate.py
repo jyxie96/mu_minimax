@@ -3,7 +3,6 @@ import numpy as np
 import random
 import time
 import os
-from numpy.linalg import inv
 from sklearn.preprocessing import OneHotEncoder, TargetEncoder
 from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LassoCV
@@ -11,6 +10,31 @@ from sklearn.linear_model import LassoCV
 RANDOM_SEED = 42
 random.seed(RANDOM_SEED)
 np.random.seed(RANDOM_SEED)
+
+def _statistical_tolerance(
+    p,
+    n,
+    tol_scale=1e-3,
+    Nr=None,
+    N_f=None,
+    w_f=None,
+    *,
+    from_uls=False,
+):
+    n_safe = max(int(n), 1)
+    eps_sub = np.sqrt(p / n_safe)
+    if from_uls and Nr is not None and N_f is not None:
+        m = max(min(int(Nr), int(N_f)), 1)
+        eps_bottleneck = np.sqrt(p / m)
+        denom = np.sqrt(max(n_safe * m, 1))
+        if w_f is not None:
+            eps_omega = float(w_f) * float(p) / denom
+            eps_stat = max(eps_sub, eps_omega)
+        else:
+            eps_stat = eps_sub
+    else:
+        eps_stat = eps_sub
+    return tol_scale * eps_stat
 
 
 def clean_data(df, feature_cols, target_col):
@@ -161,15 +185,6 @@ def fit_encoder(train_features, encoding_method='onehot',
         X_retain_onehot = np.zeros((len(retain_features), 0))
         X_forget_onehot = np.zeros((len(forget_features), 0))
 
-    if len(target_encoding_cols) > 0:
-        X_full_target_enc = full_features[target_encoding_cols].values.astype(float)
-        X_retain_target_enc = retain_features[target_encoding_cols].values.astype(float)
-        X_forget_target_enc = forget_features[target_encoding_cols].values.astype(float)
-    else:
-        X_full_target_enc = np.zeros((len(full_features), 0))
-        X_retain_target_enc = np.zeros((len(retain_features), 0))
-        X_forget_target_enc = np.zeros((len(forget_features), 0))
-
     col_nonzero_full = (X_full_onehot != 0).any(axis=0)
     col_nonzero_retain = (X_retain_onehot != 0).any(axis=0)
     col_nonzero_forget = (X_forget_onehot != 0).any(axis=0)
@@ -181,7 +196,7 @@ def fit_encoder(train_features, encoding_method='onehot',
     y_full_for_lasso = full_df_valid[target_col].values
 
     alphas = np.logspace(-2, 2, 50)
-    lasso_cv = LassoCV(alphas=alphas, cv=10, random_state=RANDOM_SEED, n_jobs=-1, max_iter=10000)
+    lasso_cv = LassoCV(alphas=alphas, cv=50, random_state=RANDOM_SEED, n_jobs=-1, max_iter=10000)
     lasso_cv.fit(X_full_nonzero, y_full_for_lasso)
     lasso_selected_mask = (lasso_cv.coef_ != 0)
     n_selected = lasso_selected_mask.sum()
@@ -265,224 +280,261 @@ def prepare_X_y(df, feature_cols, target_col, encoder, encoding_method='onehot')
     return X, np.log10(y), np.ones(len(df), dtype=bool)
 
 
-def ols_estimator(X, y):
-    XTX = X.T @ X
-    theta = np.linalg.inv(XTX) @ (X.T @ y)
-    return theta
+DEFAULT_LR = 1e-3  # fallback only when Lipschitz bound is non-positive
 
 
-def uls_estimator(w_r, w_f, X_r_sub, X_f, y_f, theta_ptr):
-    cov_r_sub = (1 / X_r_sub.shape[0]) * (X_r_sub.T @ X_r_sub)
-    cov_f = (1 / X_f.shape[0]) * (X_f.T @ X_f)
-    cov_ptr_sub = w_r * cov_r_sub + w_f * cov_f
-    M_f = (1 / X_f.shape[0]) * (X_f.T @ y_f)
-
-    matrix_to_invert = w_r * cov_r_sub
-    theta = np.linalg.inv(matrix_to_invert) @ (cov_ptr_sub @ theta_ptr - w_f * M_f)
-    return theta
+def _lipschitz_gd_lr(A, default_lr=DEFAULT_LR):
+    """Step size 1 / λ_max(A) for GD on Aθ = b (A ⪰ 0)."""
+    L = float(np.linalg.eigvalsh(A)[-1])
+    return float(default_lr)
+    
 
 
-def _compute_theta_for_lambda(X_r_sub, y_r_sub, X_f, y_f, lamb, estimator_type='gd',
-                              w_r=None, w_f=None, theta_ptr=None):
-    if estimator_type == 'gd':
-        cov_r_sub = (1 / X_r_sub.shape[0]) * (X_r_sub.T @ X_r_sub)
-        cov_f = (1 / X_f.shape[0]) * (X_f.T @ X_f)
-        A = inv(-cov_f + lamb * cov_r_sub)
-        b = -(1 / X_f.shape[0]) * (X_f.T @ y_f) + (lamb / X_r_sub.shape[0]) * (X_r_sub.T @ y_r_sub)
-        return A @ b
-    elif estimator_type == 'uls_plus':
-        cov_r_sub = (1 / X_r_sub.shape[0]) * (X_r_sub.T @ X_r_sub)
-        cov_f = (1 / X_f.shape[0]) * (X_f.T @ X_f)
-        cov_ptr = w_f * cov_f + w_r * cov_r_sub
-        A = inv((w_r + lamb) * cov_r_sub)
-        b = (-(w_f / X_f.shape[0]) * (X_f.T @ y_f)
-             + (lamb / X_r_sub.shape[0]) * (X_r_sub.T @ y_r_sub)
-             + cov_ptr @ theta_ptr)
-        return A @ b
+def ols_estimator(
+    X,
+    y,
+    tol_scale=1e-3,
+    max_iter=800000,
+    tol=None,
+    verbose=True,
+    return_iters=False,
+    tol_n=None,
+):
+    """OLS via GD on cov θ = M with cov = XᵀX/n, M = Xᵀy/n."""
+    n, d = X.shape
+    cov = (1 / n) * (X.T @ X)
+    M = (1 / n) * (X.T @ y)
+    A = cov
+
+    lr = _lipschitz_gd_lr(A)
+    theta = np.zeros(d)
+    m_norm = max(np.linalg.norm(M), np.finfo(float).tiny)
+    if tol is None:
+        n_for_tol = int(tol_n) if tol_n is not None else n
+        tol = _statistical_tolerance(p=d, n=n_for_tol, tol_scale=tol_scale)
     else:
-        raise ValueError(f"Unknown estimator_type: {estimator_type}")
+        tol = float(tol)
+
+    iters = 0
+    for _ in range(max_iter):
+        res = A @ theta - M
+        rel_resid = np.linalg.norm(res) / m_norm
+        if rel_resid < tol:
+            break
+        theta = theta - lr * res
+        iters += 1
+
+    if verbose:
+        print(f"[OLS] lr={lr:.4g} iters={iters}")
+    if return_iters:
+        return theta, iters
+    return theta
 
 
-def _compute_retain_loss(X_r_sub, y_r_sub, theta, lamb, n_r_sub):
+def _compute_retain_loss(X_r_sub, y_r_sub, theta):
     residuals = y_r_sub - X_r_sub @ theta
-    return (1 / n_r_sub) * (residuals ** 2).sum()
+    return float(np.mean(residuals ** 2))
 
 
-def _compute_full_loss(X_r_sub, y_r_sub, X_f, y_f, theta, lamb, n_r_sub, n_f):
-    residuals_f = y_f - X_f @ theta
-    forget_loss = -(1 / n_f) * (residuals_f ** 2).sum()
-    return forget_loss
+def tl_estimator(
+    X_r_sub,
+    y_r_sub,
+    theta_ptr,
+    tl_lamb,
+    tol_scale=1e-3,
+    max_iter=200000,
+    tol=None,
+    Nr=None,
+    N_f=None,
+    w_f=None,
+    delta=None,
+    verbose=True,
+    return_iters=False,
+    tol_n=None,
+):
+    """TL via GD on (cov + tl_lamb I)θ = M + tl_lamb θ_ptr."""
+    n_r_sub, p = X_r_sub.shape
+    cov = (1 / n_r_sub) * (X_r_sub.T @ X_r_sub)
+    M = (1 / n_r_sub) * (X_r_sub.T @ y_r_sub)
+    A = cov + float(tl_lamb) * np.eye(p)
+    b = M + float(tl_lamb) * theta_ptr
+
+    rhs_norm = max(np.linalg.norm(b), np.finfo(float).tiny)
+    L = float(np.linalg.eigvalsh(A)[-1])
+    if L <= 0:
+        if return_iters:
+            return theta_ptr.copy(), 0
+        return theta_ptr.copy()
+    lr = 1.0 / L
+
+    if tol is None:
+        n_for_tol = int(tol_n) if tol_n is not None else n_r_sub
+        n_safe = max(n_for_tol, 1)
+        if Nr is not None and N_f is not None and w_f is not None and delta is not None:
+            N_safe = max(int(Nr) + int(N_f), 1)
+            tol = float(tol_scale) * min(
+                float(np.sqrt(p / n_safe)),
+                np.sqrt(p / N_safe) + float(w_f) * float(delta),
+            )
+        else:
+            tol = _statistical_tolerance(p=p, n=n_r_sub, tol_scale=tol_scale)
+    else:
+        tol = float(tol)
+
+    theta = theta_ptr.copy()
+    iters = 0
+    for _ in range(int(max_iter)):
+        res = A @ theta - b
+        rel_resid = np.linalg.norm(res) / rhs_norm
+        if rel_resid < tol:
+            break
+        theta = theta - lr * res
+        iters += 1
+
+    if verbose:
+        print(f"[TL] tl_lamb={float(tl_lamb):.4g} lr={lr:.4g} iters={iters}")
+    if return_iters:
+        return theta, iters
+    return theta
 
 
-def _cross_validate_lambda(X_r_sub, y_r_sub, X_f, y_f, lambda_candidates, k_folds=5,
-                           use_full_loss=False, estimator_type='gd', w_r=None, w_f=None,
-                           theta_ptr=None, random_state=42):
+def cross_validate_tl_lambda(
+    X_r_sub,
+    y_r_sub,
+    lambda_candidates,
+    theta_ptr,
+    k_folds=5,
+    random_state=42,
+    tol_n=None,
+):
     n_r_sub = X_r_sub.shape[0]
-    n_f = X_f.shape[0]
-
+    if tol_n is None:
+        tol_n = n_r_sub
     rng = np.random.RandomState(random_state)
     indices = np.arange(n_r_sub)
     rng.shuffle(indices)
-    fold_size = n_r_sub // k_folds
-    folds = [indices[i * fold_size:(i + 1) * fold_size] for i in range(k_folds)]
 
+    fold_size = max(1, n_r_sub // k_folds)
+    folds = [indices[i * fold_size : (i + 1) * fold_size] for i in range(k_folds)]
     if len(indices) > k_folds * fold_size:
-        folds[-1] = np.concatenate([folds[-1], indices[k_folds * fold_size:]])
+        folds[-1] = np.concatenate([folds[-1], indices[k_folds * fold_size :]])
 
-    cv_scores = {lamb: [] for lamb in lambda_candidates}
-
+    cv_scores = {float(lamb): [] for lamb in lambda_candidates}
     for fold_idx in range(k_folds):
-        val_indices = folds[fold_idx]
-        train_indices = np.concatenate([folds[i] for i in range(k_folds) if i != fold_idx])
+        val_idx = folds[fold_idx]
+        train_idx = np.concatenate([folds[i] for i in range(k_folds) if i != fold_idx])
+        X_tr, y_tr = X_r_sub[train_idx], y_r_sub[train_idx]
+        X_val, y_val = X_r_sub[val_idx], y_r_sub[val_idx]
 
-        X_r_train = X_r_sub[train_indices]
-        y_r_train = y_r_sub[train_indices]
-        X_r_val = X_r_sub[val_indices]
-        y_r_val = y_r_sub[val_indices]
-
-        for lamb in lambda_candidates:
+        for tl_lamb in lambda_candidates:
             try:
-                if estimator_type == 'uls_plus':
-                    theta = _compute_theta_for_lambda(
-                        X_r_train, y_r_train, X_f, y_f, lamb,
-                        estimator_type='uls_plus', w_r=w_r, w_f=w_f, theta_ptr=theta_ptr,
-                    )
-                else:
-                    theta = _compute_theta_for_lambda(
-                        X_r_train, y_r_train, X_f, y_f, lamb,
-                        estimator_type=estimator_type,
-                    )
-                n_r_val = len(X_r_val)
-                if use_full_loss:
-                    score = _compute_full_loss(X_r_val, y_r_val, X_f, y_f, theta, lamb, n_r_val, n_f)
-                else:
-                    score = _compute_retain_loss(X_r_val, y_r_val, theta, lamb, n_r_val)
-                cv_scores[lamb].append(score)
+                theta = tl_estimator(
+                    X_tr, y_tr, theta_ptr, float(tl_lamb),
+                    verbose=False, tol_n=tol_n,
+                )
+                cv_scores[float(tl_lamb)].append(_compute_retain_loss(X_val, y_val, theta))
             except Exception:
-                pass
+                continue
 
-    mean_scores = {lamb: np.mean(scores) for lamb, scores in cv_scores.items() if len(scores) > 0}
-
-    if len(mean_scores) == 0:
-        return lambda_candidates[0], cv_scores
-
-    best_lambda = min(mean_scores, key=mean_scores.get)
-    return best_lambda, mean_scores
+    mean_scores = {lamb: float(np.mean(s)) for lamb, s in cv_scores.items() if s}
+    if mean_scores:
+        return float(min(mean_scores, key=mean_scores.get))
+    return float(lambda_candidates[0])
 
 
-def graddiff_estimator(X_r_sub, y_r_sub, X_f, y_f, w_f, w_r_sub, p, delta=1,
-                       use_cv=True, k_folds=5, n_lambda_candidates=50,
-                       use_full_loss=False, cv_random_state=42):
-    """Returns (theta, lambda, cv_time) where cv_time is the time spent on CV only."""
-    cov_r_sub = (1 / X_r_sub.shape[0]) * (X_r_sub.T @ X_r_sub)
-    cov_f = (1 / X_f.shape[0]) * (X_f.T @ X_f)
-    n_r_sub = X_r_sub.shape[0]
-    n_f = X_f.shape[0]
-
-    eig_f = np.linalg.eigvalsh(cov_f)
-    max_eig_f = np.max(eig_f)
-    eig_r_sub = np.linalg.eigvalsh(cov_r_sub)
-    min_eig_r_sub = np.min(eig_r_sub)
-
-    c1 = np.sqrt(w_r_sub / w_f) + np.sqrt(n_r_sub / p) * delta
-    c2 = 2 * max_eig_f / min_eig_r_sub
-    lambda_min = c2
-
-    cv_time = 0.0
+def tl_estimator_with_lambda_selection(
+    X_r_sub,
+    y_r_sub,
+    theta_ptr,
+    use_cv=True,
+    k_folds=5,
+    n_lambda_candidates=20,
+    tl_lambda_min=0.01,
+    tl_lambda_max=10.0,
+    cv_random_state=42,
+    tol_scale=1e-3,
+    max_iter=200000,
+    tol=None,
+    Nr=None,
+    N_f=None,
+    w_f=None,
+    delta=None,
+    tol_n=None,
+):
+    if tol_n is None:
+        tol_n = int(X_r_sub.shape[0])
     if use_cv:
-        u_max = 1.0 / lambda_min
-        u_min = 1e-4
-        u_candidates = np.logspace(np.log10(u_min), np.log10(u_max), n_lambda_candidates)
-        lambda_candidates = 1.0 / u_candidates
-
-        cv_start = time.time()
-        best_lambda, _ = _cross_validate_lambda(
-            X_r_sub, y_r_sub, X_f, y_f, lambda_candidates,
-            k_folds=k_folds, use_full_loss=use_full_loss,
-            random_state=cv_random_state,
+        lambda_candidates = np.logspace(
+            np.log10(float(tl_lambda_min)),
+            np.log10(float(tl_lambda_max)),
+            int(n_lambda_candidates),
         )
-        cv_time = time.time() - cv_start
-        lamb = best_lambda
+        tl_lamb = cross_validate_tl_lambda(
+            X_r_sub, y_r_sub, lambda_candidates, theta_ptr,
+            k_folds=k_folds, random_state=cv_random_state, tol_n=tol_n,
+        )
     else:
-        lamb = max(c1, c2)
+        tl_lamb = 1.0
 
-    A = inv(-cov_f + lamb * cov_r_sub)
-    b = -(1 / n_f) * (X_f.T @ y_f) + (lamb / n_r_sub) * (X_r_sub.T @ y_r_sub)
-    theta = A @ b
-    return theta, lamb, cv_time
+    theta = tl_estimator(
+        X_r_sub, y_r_sub, theta_ptr, tl_lamb,
+        tol_scale=tol_scale, max_iter=max_iter, tol=tol,
+        Nr=Nr, N_f=N_f, w_f=w_f, delta=delta, tol_n=tol_n,
+    )
+    return theta, float(tl_lamb)
 
 
-def uls_plus_estimator(w_r, w_f, X_r_sub, y_r_sub, X_f, y_f, theta_ptr, delta=1, c=1,
-                       use_cv=True, k_folds=5, n_lambda_candidates=50,
-                       use_full_loss=False, cv_random_state=42):
-    """Returns (theta, lambda, cv_time) where cv_time is the time spent on CV only."""
+def uls_estimator(
+    w_r,
+    w_f,
+    X_r_sub,
+    X_f,
+    y_f,
+    theta_ptr,
+    tol_scale=1e-3,
+    max_iter=800000,
+    tol=None,
+    cov_f=None,
+    M_f=None,
+    verbose=True,
+    tol_n=None,
+):
+    """ULS via GD (unregularized fixed-point)."""
     n_r_sub = X_r_sub.shape[0]
-    n_f = X_f.shape[0]
-
-    cv_time = 0.0
-    if use_cv:
-        u_max = 1e4
-        u_min = 1e-4
-        u_candidates = np.logspace(np.log10(u_min), np.log10(u_max), n_lambda_candidates)
-        lambda_candidates = 1.0 / u_candidates
-
-        cv_start = time.time()
-        best_lambda, _ = _cross_validate_lambda(
-            X_r_sub, y_r_sub, X_f, y_f, lambda_candidates,
-            k_folds=k_folds, use_full_loss=use_full_loss,
-            estimator_type='uls_plus', w_r=w_r, w_f=w_f, theta_ptr=theta_ptr,
-            random_state=cv_random_state,
-        )
-        cv_time = time.time() - cv_start
-        lamb = best_lambda
-    else:
-        lamb = c * w_r * w_f * delta
+    p = X_r_sub.shape[1]
 
     cov_r_sub = (1 / n_r_sub) * (X_r_sub.T @ X_r_sub)
-    cov_f = (1 / n_f) * (X_f.T @ X_f)
-    cov_ptr = w_f * cov_f + w_r * cov_r_sub
-    A = inv((w_r + lamb) * cov_r_sub)
-    b = (-(w_f / n_f) * (X_f.T @ y_f)
-         + (lamb / n_r_sub) * (X_r_sub.T @ y_r_sub)
-         + cov_ptr @ theta_ptr)
-    theta = A @ b
-    return theta, lamb, cv_time
 
+    if cov_f is None:
+        cov_f = (1 / X_f.shape[0]) * (X_f.T @ X_f)
+    if M_f is None:
+        M_f = (1 / X_f.shape[0]) * (X_f.T @ y_f)
 
-def uls_inference(v, theta_uls, n_retain, n_retain_sub, X_r_sub, y_r_sub, theta_ptr, theta_r,
-                  z_alpha=1.96):
-    cov_r_sub = (1 / X_r_sub.shape[0]) * (X_r_sub.T @ X_r_sub)
-    inv_cov_r_sub = inv(cov_r_sub)
-    f_i = 0
-    g_i = 0
-    w_1 = 1 / (n_retain ** 2)
-    w_2 = (n_retain_sub - n_retain) / n_retain_sub
-    w_3 = (n_retain - n_retain_sub) / ((n_retain ** 2) * n_retain_sub)
-    for i in range(X_r_sub.shape[0]):
-        x_i = X_r_sub[i, :].reshape(-1, 1)
-        a_i = v.T @ inv_cov_r_sub @ X_r_sub[i, :] * (y_r_sub[i] - X_r_sub[i, :].T @ theta_uls)
-        mat = x_i @ x_i.T - cov_r_sub
-        b_i = v.T @ inv_cov_r_sub @ mat @ (theta_uls - theta_ptr)
-        f_i += (a_i + w_2 * b_i) ** 2
-        g_i += (a_i + b_i) ** 2
-    V_r = w_1 * f_i + (w_3 * g_i)
-    se_r = np.sqrt(V_r)
-    psi_r = float(v @ theta_uls)
-    return psi_r, z_alpha * se_r
+    rhs = (w_r * cov_r_sub + w_f * cov_f) @ theta_ptr - w_f * M_f
+    rhs_norm = max(np.linalg.norm(rhs), np.finfo(float).tiny)
+    # GD on (ω_r Σ_r) θ = rhs  ⇒  safe step 1 / λ_max(ω_r Σ_r)
+    A = w_r * cov_r_sub
+    alpha = _lipschitz_gd_lr(A)
 
+    if tol is None:
+        n_for_tol = int(tol_n) if tol_n is not None else n_r_sub
+        tol = _statistical_tolerance(p=p, n=n_for_tol, tol_scale=tol_scale)
+    else:
+        tol = float(tol)
 
-def retain_sub_inference(v, p, theta_retain_sub, X_r_sub, y_r_sub, theta_r, z_alpha=1.96):
-    n_retain_sub = X_r_sub.shape[0]
+    theta = theta_ptr.copy()
+    iters = 0
+    for _ in range(max_iter):
+        res = A @ theta - rhs
+        rel_resid = np.linalg.norm(res) / rhs_norm
+        if rel_resid < tol:
+            break
+        theta = theta - alpha * res
+        iters += 1
 
-    residuals = y_r_sub - X_r_sub @ theta_retain_sub
-    sigma_sq_hat = np.sum(residuals ** 2) / (n_retain_sub - p)
-
-    inv_XTX = inv(X_r_sub.T @ X_r_sub)
-    cov_theta = sigma_sq_hat * inv_XTX
-
-    se = np.sqrt(v.T @ cov_theta @ v)
-    psi_retain_sub = float(v.T @ theta_retain_sub)
-    return psi_retain_sub, z_alpha * se
+    if verbose:
+        print(f"[ULS] lr={alpha:.4g} iters={iters}")
+    return theta
 
 
 def calculate_prediction_error(X_test, y_test, theta):
@@ -493,6 +545,13 @@ def calculate_prediction_error(X_test, y_test, theta):
 
 def main():
     start_time = time.time()
+    RUN_RETAIN_SUB = True
+    RUN_TL = True
+    TL_CV_K_FOLDS = 5
+    TL_N_LAMBDA = 20
+    TL_LAMBDA_MIN = 0.01
+    TL_LAMBDA_MAX = 10.0
+
     data_file_2022 = '/data/xiejingyi/dataset/hesin_2022.csv'
     feature_cols = [
         'admimeth_uni', 'classpat_uni', 'intmanag_uni',
@@ -517,245 +576,209 @@ def main():
 
     encoding_method = 'onehot'
     merge_admimeth_to_other = True
-    fold_count = 20
+    N_REPEATS = 20
     subsample_ratios = [0.1, 0.2, 0.3]
 
     results_dir = '/data/xiejingyi/dataset/ukb_fold_results'
     os.makedirs(results_dir, exist_ok=True)
 
     combined_rows = []
-    successful_folds = 0
+    successful_repeats = 0
     total_attempts = 0
 
-    while successful_folds < fold_count:
+    while successful_repeats < N_REPEATS:
         total_attempts += 1
-        fold_idx = successful_folds + 1
-        fold_start = time.time()
+        repeat_idx = successful_repeats + 1
+        repeat_start = time.time()
 
-        print(f"\n=== Fold {fold_idx} / {fold_count} (attempt {total_attempts}) ===")
+        print(f"\n=== Repeat {repeat_idx} / {N_REPEATS} (attempt {total_attempts}) ===")
 
         try:
-            train_idx_fold, test_idx_fold = train_test_split(
+            train_idx, test_idx = train_test_split(
                 np.arange(len(df_retain)),
                 test_size=0.2,
-                random_state=RANDOM_SEED + fold_idx,
+                random_state=RANDOM_SEED + repeat_idx,
                 shuffle=True,
             )
 
-            df_retain_train_fold = df_retain.iloc[train_idx_fold].reset_index(drop=True)
-            df_retain_test_fold = df_retain.iloc[test_idx_fold].reset_index(drop=True)
+            df_retain_train = df_retain.iloc[train_idx].reset_index(drop=True)
+            df_retain_test = df_retain.iloc[test_idx].reset_index(drop=True)
 
-            df_full_for_encoder = pd.concat([df_retain_train_fold, df_forget], ignore_index=True)
+            df_full_for_encoder = pd.concat([df_retain_train, df_forget], ignore_index=True)
             train_features_combined = prepare_features(
-                df_full_for_encoder, feature_cols,
+                df_full_for_encoder,
+                feature_cols,
                 target_encoding_cols=target_encoding_cols,
                 merge_admimeth_to_other=merge_admimeth_to_other,
             )
 
             encoder, encoding_method = fit_encoder(
-                train_features_combined, encoding_method,
-                full_df=df_full_for_encoder, retain_df=df_retain_train_fold,
-                forget_df=df_forget, feature_cols=feature_cols,
+                train_features_combined,
+                encoding_method,
+                full_df=df_full_for_encoder,
+                retain_df=df_retain_train,
+                forget_df=df_forget,
+                feature_cols=feature_cols,
                 target_col=target_col,
                 target_encoding_cols=target_encoding_cols,
                 merge_admimeth_to_other=merge_admimeth_to_other,
             )
 
-            X_retain_train_fold, y_retain_train_fold, _ = prepare_X_y(
-                df_retain_train_fold, feature_cols, target_col, encoder, encoding_method,
+            X_retain_train, y_retain_train, _ = prepare_X_y(
+                df_retain_train, feature_cols, target_col, encoder, encoding_method,
             )
-            X_test_fold, y_test_fold, _ = prepare_X_y(
-                df_retain_test_fold, feature_cols, target_col, encoder, encoding_method,
+            X_test, y_test, _ = prepare_X_y(
+                df_retain_test, feature_cols, target_col, encoder, encoding_method,
             )
-            X_forget_fold, y_forget_fold, _ = prepare_X_y(
+            X_forget, y_forget, _ = prepare_X_y(
                 df_forget, feature_cols, target_col, encoder, encoding_method,
             )
 
-            operstat_idx = encoder.get('operstat_idx')
-            if operstat_idx is None:
-                raise ValueError("operstat covariate index not found in encoder")
-
-            p = X_retain_train_fold.shape[1]
-            selected_feature_names = encoder.get('selected_feature_names', [])
-            if operstat_idx >= len(selected_feature_names):
-                raise ValueError(
-                    f"operstat covariate index ({operstat_idx}) is out of range "
-                    f"for selected features (len={len(selected_feature_names)})"
-                )
-
-            tretspef_uni_name = selected_feature_names[operstat_idx]
-            if tretspef_uni_name != 'operstat_One or more operative procedures performed':
-                raise ValueError(
-                    f"Expected operstat at index {operstat_idx}, but found {tretspef_uni_name}"
-                )
-
-            operstat_idx_in_X = operstat_idx + 1
-            if operstat_idx_in_X >= p:
-                raise ValueError(
-                    f"operstat covariate index in X ({operstat_idx_in_X}) is out of range (p={p})"
-                )
-
-            v = np.zeros(p)
-            v[operstat_idx_in_X] = 1.0
-
             computation_times = {}
 
-            # Pre-train (OLS on full = retain_train + forget)
-            t_start = time.time()
+            t0 = time.time()
             theta_ptr = ols_estimator(
-                np.vstack([X_retain_train_fold, X_forget_fold]),
-                np.concatenate([y_retain_train_fold, y_forget_fold]),
+                np.vstack([X_retain_train, X_forget]),
+                np.concatenate([y_retain_train, y_forget]),
+                verbose=False,
             )
-            computation_times['Pre-train'] = time.time() - t_start
+            computation_times['Pre-train'] = time.time() - t0
 
-            # Retrain (OLS on retain_train only)
-            t_start = time.time()
-            theta_retrain = ols_estimator(X_retain_train_fold, y_retain_train_fold)
-            computation_times['Retrain'] = time.time() - t_start
+            t0 = time.time()
+            theta_retrain = ols_estimator(X_retain_train, y_retain_train, verbose=False)
+            computation_times['Retrain'] = time.time() - t0
 
             theta_retain_subs = {}
             theta_uls_dict = {}
-            theta_graddiff_dict = {}
-            theta_uls_plus_dict = {}
+            theta_tl_dict = {}
 
-            n_retain_train = len(X_retain_train_fold)
-            n_forget = len(X_forget_fold)
+            n_retain_train = len(X_retain_train)
+            n_forget = len(X_forget)
             w_r = n_retain_train / (n_retain_train + n_forget)
             w_f = n_forget / (n_retain_train + n_forget)
-            train_indices_for_subsampling = np.arange(len(X_retain_train_fold)).tolist()
+            train_indices_for_subsampling = np.arange(len(X_retain_train)).tolist()
 
-            for idx, ratio in enumerate(subsample_ratios):
-                sub_sample_size = max(1, int(n_retain_train * ratio))
-                sampled_indices = random.sample(train_indices_for_subsampling, sub_sample_size)
-                X_retain_sub = X_retain_train_fold[sampled_indices]
-                y_retain_sub = y_retain_train_fold[sampled_indices]
+            cov_f = (1 / X_forget.shape[0]) * (X_forget.T @ X_forget)
+            M_f = (1 / X_forget.shape[0]) * (X_forget.T @ y_forget)
 
-                # Retain-Sub
-                t_start = time.time()
-                theta_sub = ols_estimator(X_retain_sub, y_retain_sub)
-                computation_times[f'Retain-Sub-{idx}'] = time.time() - t_start
-                theta_retain_subs[idx] = theta_sub
+            if RUN_RETAIN_SUB or RUN_TL:
+                for idx, ratio in enumerate(subsample_ratios):
+                    sub_sample_size = max(1, int(n_retain_train * ratio))
+                    sampled_indices = random.sample(train_indices_for_subsampling, sub_sample_size)
+                    X_retain_sub = X_retain_train[sampled_indices]
+                    y_retain_sub = y_retain_train[sampled_indices]
+                    n_r_sub = int(X_retain_sub.shape[0])
 
-                # ULS
-                t_start = time.time()
-                theta_uls = uls_estimator(w_r, w_f, X_retain_sub, X_forget_fold, y_forget_fold, theta_ptr)
-                computation_times[f'ULS-{idx}'] = time.time() - t_start
-                theta_uls_dict[idx] = theta_uls
+                    if RUN_RETAIN_SUB:
+                        name = f'Retain-Sub-{idx}'
+                        t0 = time.time()
+                        theta_sub = ols_estimator(
+                            X_retain_sub, y_retain_sub, verbose=False, tol_n=n_r_sub,
+                        )
+                        computation_times[name] = time.time() - t0
+                        theta_retain_subs[idx] = theta_sub
 
-                # Graddiff
-                w_r_sub = sub_sample_size / (n_retain_train + n_forget)
-                t_start = time.time()
-                theta_graddiff, lambda_graddiff, cv_time_gd = graddiff_estimator(
-                    X_retain_sub, y_retain_sub, X_forget_fold, y_forget_fold, w_f, w_r_sub, p,
-                )
-                total_time_gd = time.time() - t_start
-                computation_times[f'Graddiff-{idx}'] = total_time_gd - cv_time_gd
-                theta_graddiff_dict[idx] = (theta_graddiff, lambda_graddiff)
+                        name = f'ULS-{idx}'
+                        t0 = time.time()
+                        theta_uls = uls_estimator(
+                            w_r, w_f,
+                            X_retain_sub, X_forget, y_forget, theta_ptr,
+                            verbose=False, tol_n=n_r_sub,
+                            cov_f=cov_f, M_f=M_f,
+                        )
+                        computation_times[name] = time.time() - t0
+                        theta_uls_dict[idx] = theta_uls
 
-                t_start = time.time()
-                theta_uls_plus, lambda_uls_plus, cv_time_up = uls_plus_estimator(
-                    w_r, w_f, X_retain_sub, y_retain_sub, X_forget_fold, y_forget_fold, theta_ptr,
-                )
-                total_time_up = time.time() - t_start
-                computation_times[f'ULS-Plus-{idx}'] = total_time_up - cv_time_up
-                theta_uls_plus_dict[idx] = (theta_uls_plus, lambda_uls_plus)
+                    if RUN_TL:
+                        name = f'TL-{idx}'
+                        t0 = time.time()
+                        theta_tl, tl_lamb = tl_estimator_with_lambda_selection(
+                            X_retain_sub, y_retain_sub, theta_ptr,
+                            k_folds=TL_CV_K_FOLDS,
+                            n_lambda_candidates=TL_N_LAMBDA,
+                            tl_lambda_min=TL_LAMBDA_MIN,
+                            tl_lambda_max=TL_LAMBDA_MAX,
+                            cv_random_state=RANDOM_SEED + repeat_idx + 10000 * (idx + 1),
+                            tol_n=n_r_sub,
+                            Nr=n_r_sub, N_f=n_forget, w_f=w_f, delta=1,
+                        )
+                        computation_times[name] = time.time() - t0
+                        theta_tl_dict[idx] = (theta_tl, tl_lamb)
 
-                # Inference
-                n_retain_sub = len(X_retain_sub)
-                try:
-                    uls_psi, uls_se = uls_inference(
-                        v, theta_uls, n_retain_train, n_retain_sub,
-                        X_retain_sub, y_retain_sub, theta_ptr, theta_retrain, z_alpha=1.96,
-                    )
-                    ols_psi, ols_se = retain_sub_inference(
-                        v, p, theta_sub, X_retain_sub, y_retain_sub, theta_retrain, z_alpha=1.96,
-                    )
+            repeat_result = {}
 
-                    print(f"  Ratio {ratio:.2f} - ULS inference: CI = {uls_psi:.6f} +- {uls_se:.6f}")
-                    print(f"  Ratio {ratio:.2f} - Retain-sub inference: CI = {ols_psi:.6f} +- {ols_se:.6f}")
-
-                except Exception:
-                    import traceback
-                    traceback.print_exc()
-
-            # Collect fold results
-            fold_result = {}
-
-            fold_result['Pre-train'] = {
-                'pred_error': calculate_prediction_error(X_test_fold, y_test_fold, theta_ptr),
+            repeat_result['Pre-train'] = {
+                'pred_error': calculate_prediction_error(X_test, y_test, theta_ptr),
                 'comp_time': computation_times['Pre-train'],
             }
-
-            fold_result['Retrain'] = {
-                'pred_error': calculate_prediction_error(X_test_fold, y_test_fold, theta_retrain),
+            repeat_result['Retrain'] = {
+                'pred_error': calculate_prediction_error(X_test, y_test, theta_retrain),
                 'comp_time': computation_times['Retrain'],
             }
-
             for idx, theta in theta_retain_subs.items():
-                key = f'Retain-Sub-{idx}'
-                fold_result[key] = {
-                    'pred_error': calculate_prediction_error(X_test_fold, y_test_fold, theta),
-                    'comp_time': computation_times[key],
+                name = f'Retain-Sub-{idx}'
+                repeat_result[name] = {
+                    'pred_error': calculate_prediction_error(X_test, y_test, theta),
+                    'comp_time': computation_times[name],
                 }
-
             for idx, theta in theta_uls_dict.items():
-                key = f'ULS-{idx}'
-                fold_result[key] = {
-                    'pred_error': calculate_prediction_error(X_test_fold, y_test_fold, theta),
-                    'comp_time': computation_times[key],
+                name = f'ULS-{idx}'
+                repeat_result[name] = {
+                    'pred_error': calculate_prediction_error(X_test, y_test, theta),
+                    'comp_time': computation_times[name],
                 }
-
-            for idx, (theta, lamb) in theta_graddiff_dict.items():
-                key = f'Graddiff-{idx}'
-                fold_result[key] = {
-                    'pred_error': calculate_prediction_error(X_test_fold, y_test_fold, theta),
-                    'comp_time': computation_times[key],
-                    'lambda': lamb,
-                }
-
-            for idx, (theta, lamb) in theta_uls_plus_dict.items():
-                key = f'ULS-Plus-{idx}'
-                fold_result[key] = {
-                    'pred_error': calculate_prediction_error(X_test_fold, y_test_fold, theta),
-                    'comp_time': computation_times[key],
-                    'lambda': lamb,
+            for idx, (theta, tl_lamb) in theta_tl_dict.items():
+                name = f'TL-{idx}'
+                repeat_result[name] = {
+                    'pred_error': calculate_prediction_error(X_test, y_test, theta),
+                    'comp_time': computation_times[name],
+                    'tl_lambda': tl_lamb,
                 }
 
             print(f"\n{'Estimator':<20} {'Pred Error (MSE)':<20} {'Comp Time (s)':<15}")
-            for name, metrics in fold_result.items():
+            for name, metrics in repeat_result.items():
                 print(f"{name:<20} {metrics['pred_error']:<20.6f} {metrics['comp_time']:<15.6f}")
 
-            for name, metrics in fold_result.items():
+            repeat_duration = time.time() - repeat_start
+            print(f"Repeat {repeat_idx} completed in {repeat_duration:.2f} seconds")
+
+            for name, metrics in repeat_result.items():
                 combined_rows.append({
-                    'fold': fold_idx,
+                    'repeat': repeat_idx,
                     'estimator': name,
                     'pred_error': metrics['pred_error'],
                     'comp_time': metrics['comp_time'],
-                    'lambda': metrics.get('lambda', 0),
+                    'tl_lambda': metrics.get('tl_lambda', 0),
                 })
 
-            df_fold = pd.DataFrame([
+            df_repeat = pd.DataFrame([
                 {
-                    'fold': fold_idx,
+                    'repeat': repeat_idx,
                     'estimator': name,
                     'pred_error': metrics['pred_error'],
                     'comp_time': metrics['comp_time'],
-                    'lambda': metrics.get('lambda', 0),
+                    'tl_lambda': metrics.get('tl_lambda', 0),
                 }
-                for name, metrics in fold_result.items()
+                for name, metrics in repeat_result.items()
             ])
-            fold_csv = os.path.join(results_dir, f'ukb_estimation_results_fold_{fold_idx}_v4.csv')
-            df_fold.to_csv(fold_csv, index=False)
+            repeat_csv = os.path.join(
+                results_dir, f'ukb_estimation_results_clean_repeat_{repeat_idx}.csv'
+            )
+            df_repeat.to_csv(repeat_csv, index=False)
+            print(f"Repeat {repeat_idx} results saved to: {repeat_csv}")
 
-            successful_folds += 1
+            successful_repeats += 1
 
         except Exception:
+            import traceback
+            traceback.print_exc()
             continue
 
     if combined_rows:
         df_all = pd.DataFrame(combined_rows)
-        combined_csv = os.path.join(results_dir, 'ukb_estimation_results_all_folds_v4.csv')
+        combined_csv = os.path.join(results_dir, 'ukb_estimation_results_clean_all_repeats.csv')
         df_all.to_csv(combined_csv, index=False)
+        print(f"Combined results saved to: {combined_csv}")
 
         grouped = df_all.groupby('estimator')
         print(f"\n{'Estimator':<20} {'Pred Mean':<15} {'Pred Std':<15} {'Comp Mean':<15}")
@@ -764,6 +787,8 @@ def main():
             pred_std = group['pred_error'].std(ddof=0)
             comp_mean = group['comp_time'].mean()
             print(f"{estimator:<20} {pred_mean:<15.6f} {pred_std:<15.6f} {comp_mean:<15.6f}")
+
+    print(f"\nTotal wall time: {time.time() - start_time:.2f}s")
 
 
 if __name__ == "__main__":
